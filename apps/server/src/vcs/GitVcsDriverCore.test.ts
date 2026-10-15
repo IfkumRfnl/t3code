@@ -2545,6 +2545,27 @@ it.layer(layerTest)("GitVcsDriver core integration", (it) => {
             aheadOfDefaultCount: 0,
           });
         }
+
+        yield* git(cwd, ["branch", "-f", initialBranch, "HEAD"]);
+        yield* git(cwd, ["update-ref", "refs/remotes/origin/trunk", "HEAD"]);
+        yield* git(cwd, ["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/trunk"]);
+        for (const base of [initialBranch, "missing-base"]) {
+          yield* git(cwd, ["config", "branch.feature/local-only.gh-merge-base", base]);
+          commands.length = 0;
+          const status = yield* driver.statusDetailsLocal(cwd, {
+            includeDivergence: false,
+            includeBranchChanges: true,
+          });
+          assert.deepEqual(status.branchChanges, {
+            baseRef: `origin/${base === initialBranch ? initialBranch : "trunk"}`,
+            insertions: base === initialBranch ? 3 : 2,
+            deletions: 0,
+          });
+          assert.lengthOf(
+            commands.filter((args) => args.join(" ") === "symbolic-ref refs/remotes/origin/HEAD"),
+            base === initialBranch ? 0 : 1,
+          );
+        }
       }),
     );
 
