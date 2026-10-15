@@ -339,6 +339,110 @@ it.effect("uses stable diagnostics for every parsed non-repository command", () 
   }).pipe(Effect.provide(layer));
 });
 
+it.effect("reads fresh tracked default-branch status without remote enumeration", () =>
+  Effect.gen(function* () {
+    const commands: ReadonlyArray<string>[] = [];
+    let upstreamRef = "origin/main";
+    let divergence = "1\t2";
+    const spawner = ChildProcessSpawner.make((command) =>
+      Effect.sync(() => {
+        if (!ChildProcess.isStandardCommand(command)) {
+          return assert.fail("expected a standard Git command");
+        }
+        commands.push(command.args);
+        const args = command.args.join(" ");
+        switch (args) {
+          case "rev-parse --abbrev-ref HEAD":
+            return makeSuccessfulHandle("main\n");
+          case "rev-parse --abbrev-ref --symbolic-full-name @{upstream}":
+            return makeSuccessfulHandle(`${upstreamRef}\n`);
+          case `rev-list --left-right --count HEAD...${upstreamRef}`:
+            return makeSuccessfulHandle(`${divergence}\n`);
+          case "symbolic-ref refs/remotes/origin/HEAD":
+            return makeSuccessfulHandle("refs/remotes/origin/main\n");
+          case "remote":
+            return makeSuccessfulHandle("origin\nteam/origin\n");
+          default:
+            return assert.fail(`unexpected Git command: ${args}`);
+        }
+      }),
+    );
+    const driver = yield* makeGitVcsDriverCore().pipe(
+      Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+    );
+    const cwd = yield* makeTmpDir();
+
+    for (const snapshot of [
+      { upstreamRef: "origin/main", aheadCount: 1, behindCount: 2 },
+      { upstreamRef: "team/origin/main", aheadCount: 3, behindCount: 4 },
+      { upstreamRef: "team/origin/main", aheadCount: 5, behindCount: 6 },
+    ]) {
+      upstreamRef = snapshot.upstreamRef;
+      divergence = `${snapshot.aheadCount}\t${snapshot.behindCount}`;
+      commands.length = 0;
+
+      const status = yield* driver.statusDetailsRemote(cwd, { refreshUpstream: false });
+
+      assert.deepStrictEqual(status, {
+        isRepo: true,
+        defaultBranch: "main",
+        isDefaultBranch: true,
+        branch: "main",
+        upstreamRef,
+        hasUpstream: true,
+        aheadCount: snapshot.aheadCount,
+        behindCount: snapshot.behindCount,
+        aheadOfDefaultCount: 0,
+      });
+      assert.deepStrictEqual(commands, [
+        ["rev-parse", "--abbrev-ref", "HEAD"],
+        ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"],
+        ["rev-list", "--left-right", "--count", `HEAD...${upstreamRef}`],
+        ["symbolic-ref", "refs/remotes/origin/HEAD"],
+      ]);
+    }
+  }).pipe(Effect.provide(layerServerConfig.pipe(Layer.provideMerge(NodeServices.layer)))),
+);
+
+it.effect("propagates remote-status upstream lookup failures without enumerating remotes", () =>
+  Effect.gen(function* () {
+    const commands: ReadonlyArray<string>[] = [];
+    const failure = PlatformError.systemError({
+      _tag: "PermissionDenied",
+      module: "ChildProcessSpawner",
+      method: "spawn",
+    });
+    const spawner = ChildProcessSpawner.make((command) =>
+      Effect.gen(function* () {
+        if (!ChildProcess.isStandardCommand(command)) {
+          return assert.fail("expected a standard Git command");
+        }
+        commands.push(command.args);
+        if (command.args.includes("@{upstream}")) {
+          return yield* failure;
+        }
+        assert.deepStrictEqual(command.args, ["rev-parse", "--abbrev-ref", "HEAD"]);
+        return makeSuccessfulHandle("main\n");
+      }),
+    );
+    const driver = yield* makeGitVcsDriverCore().pipe(
+      Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+    );
+    const cwd = yield* makeTmpDir();
+
+    const error = yield* driver
+      .statusDetailsRemote(cwd, { refreshUpstream: false })
+      .pipe(Effect.flip);
+
+    assert.equal(error.operation, "GitVcsDriver.resolveCurrentUpstream");
+    assert.strictEqual(error.cause, failure);
+    assert.deepStrictEqual(commands, [
+      ["rev-parse", "--abbrev-ref", "HEAD"],
+      ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"],
+    ]);
+  }).pipe(Effect.provide(layerServerConfig.pipe(Layer.provideMerge(NodeServices.layer)))),
+);
+
 it.effect("invalidates origin remote cache when a driver mutation adds origin", () =>
   Effect.gen(function* () {
     const driver = yield* GitVcsDriver.GitVcsDriver;
@@ -2576,6 +2680,68 @@ it.layer(layerTest)("GitVcsDriver core integration", (it) => {
       }),
     );
 
+    it.effect.each([
+      { name: "an unqualified local upstream", remote: ".", ref: "local", upstreamRef: null },
+      {
+        name: "a slash-containing local upstream",
+        remote: ".",
+        ref: "local/тема",
+        upstreamRef: "local/тема",
+      },
+      {
+        name: "a slash-containing remote",
+        remote: "team/origin",
+        ref: "тема",
+        upstreamRef: "team/origin/тема",
+      },
+      {
+        name: "a remote starting with Unicode whitespace",
+        remote: "\u00a0/team",
+        ref: "main",
+        upstreamRef: "/team/main",
+      },
+      { name: "no configured upstream", remote: null, ref: null, upstreamRef: null },
+      { name: "a missing upstream ref", remote: "origin", ref: "missing", upstreamRef: null },
+      { name: "detached HEAD", remote: null, ref: null, upstreamRef: null },
+    ])("preserves remote status for $name", (scenario) =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        yield* initRepoWithCommit(cwd);
+        yield* git(cwd, ["branch", "-M", "main"]);
+        if (scenario.remote !== null && scenario.ref !== null) {
+          if (scenario.remote === ".") {
+            yield* git(cwd, ["branch", scenario.ref]);
+          } else {
+            yield* git(cwd, ["remote", "add", scenario.remote, cwd]);
+            if (scenario.ref !== "missing") {
+              yield* git(cwd, [
+                "update-ref",
+                `refs/remotes/${scenario.remote}/${scenario.ref}`,
+                "HEAD",
+              ]);
+            }
+          }
+          yield* git(cwd, ["config", "branch.main.remote", scenario.remote]);
+          yield* git(cwd, ["config", "branch.main.merge", `refs/heads/${scenario.ref}`]);
+        }
+        const detached = scenario.name === "detached HEAD";
+        if (detached) {
+          yield* git(cwd, ["checkout", "--detach"]);
+        }
+
+        const status = yield* (yield* GitVcsDriver.GitVcsDriver).statusDetailsRemote(cwd, {
+          refreshUpstream: false,
+        });
+
+        assert.equal(status.isRepo, true);
+        assert.equal(status.branch, detached ? null : "main");
+        assert.equal(status.upstreamRef, scenario.upstreamRef);
+        assert.equal(status.hasUpstream, scenario.upstreamRef !== null);
+        assert.equal(status.aheadCount, 0);
+        assert.equal(status.behindCount, 0);
+      }),
+    );
+
     it.effect("reports remote status on unborn HEAD without failing", () =>
       Effect.gen(function* () {
         const cwd = yield* makeTmpDir();
@@ -2587,6 +2753,7 @@ it.layer(layerTest)("GitVcsDriver core integration", (it) => {
 
         assert.equal(status.isRepo, true);
         assert.equal(status.branch, initialBranch);
+        assert.equal(status.upstreamRef, null);
         assert.equal(status.hasUpstream, false);
         assert.equal(status.aheadCount, 0);
         assert.equal(status.behindCount, 0);
