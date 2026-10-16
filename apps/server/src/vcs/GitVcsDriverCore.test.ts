@@ -2583,8 +2583,33 @@ it.layer(layerTest)("GitVcsDriver core integration", (it) => {
         yield* git(cwd, ["commit", "-m", "feature commit"]);
         yield* git(cwd, ["push", "-u", "origin", "feature/remote-status"]);
         yield* writeTextFile(cwd, "untracked.txt", "local-only\n");
+        yield* git(cwd, [
+          "symbolic-ref",
+          "refs/remotes/origin/HEAD",
+          `refs/remotes/origin/${initialBranch}`,
+        ]);
 
-        const status = yield* (yield* GitVcsDriver.GitVcsDriver).statusDetailsRemote(cwd);
+        const delegate = yield* ChildProcessSpawner.ChildProcessSpawner;
+        let originHeadReads = 0;
+        let failFirstOriginHead = false;
+        const spawner = ChildProcessSpawner.make((command) =>
+          Effect.gen(function* () {
+            if (
+              ChildProcess.isStandardCommand(command) &&
+              command.args.join(" ") === "symbolic-ref refs/remotes/origin/HEAD"
+            ) {
+              originHeadReads++;
+              if (failFirstOriginHead && originHeadReads === 1) return makeNonRepositoryHandle();
+            }
+            return yield* delegate.spawn(command);
+          }),
+        );
+        const driver = yield* makeGitVcsDriverCore().pipe(
+          Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+          Effect.provide(layerServerConfig),
+        );
+        const status = yield* driver.statusDetailsRemote(cwd, { refreshUpstream: false });
+        const successfulHeadReads = originHeadReads;
 
         assert.equal(status.isRepo, true);
         assert.equal(status.branch, "feature/remote-status");
@@ -2594,6 +2619,14 @@ it.layer(layerTest)("GitVcsDriver core integration", (it) => {
         assert.equal(status.aheadOfDefaultCount, 1);
         assert.notProperty(status, "workingTree");
         assert.notProperty(status, "hasWorkingTreeChanges");
+
+        // An unavailable first read must retain the comparison lookup's retry.
+        originHeadReads = 0;
+        failFirstOriginHead = true;
+        const retried = yield* driver.statusDetailsRemote(cwd, { refreshUpstream: false });
+        assert.deepEqual(retried, { ...status, defaultBranch: null });
+        assert.equal(originHeadReads, 2);
+        assert.equal(successfulHeadReads, 1);
       }),
     );
 
