@@ -2752,21 +2752,18 @@ it.layer(layerTest)("GitVcsDriver core integration", (it) => {
       Effect.gen(function* () {
         const cwd = yield* makeTmpDir();
         const remote = yield* makeTmpDir("git-vcs-driver-remote-");
-        const { initialBranch } = yield* initRepoWithCommit(cwd);
+        yield* initRepoWithCommit(cwd);
+        yield* git(cwd, ["branch", "-M", "trunk"]);
         yield* git(remote, ["init", "--bare"]);
         yield* git(cwd, ["remote", "add", "origin", remote]);
-        yield* git(cwd, ["push", "-u", "origin", initialBranch]);
+        yield* git(cwd, ["push", "-u", "origin", "trunk"]);
         yield* git(cwd, ["checkout", "-b", "feature/remote-status"]);
         yield* writeTextFile(cwd, "feature.txt", "feature\n");
         yield* git(cwd, ["add", "feature.txt"]);
         yield* git(cwd, ["commit", "-m", "feature commit"]);
         yield* git(cwd, ["push", "-u", "origin", "feature/remote-status"]);
         yield* writeTextFile(cwd, "untracked.txt", "local-only\n");
-        yield* git(cwd, [
-          "symbolic-ref",
-          "refs/remotes/origin/HEAD",
-          `refs/remotes/origin/${initialBranch}`,
-        ]);
+        yield* git(cwd, ["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/trunk"]);
 
         const delegate = yield* ChildProcessSpawner.ChildProcessSpawner;
         let originHeadReads = 0;
@@ -2788,24 +2785,24 @@ it.layer(layerTest)("GitVcsDriver core integration", (it) => {
           Effect.provide(layerServerConfig),
         );
         const status = yield* driver.statusDetailsRemote(cwd, { refreshUpstream: false });
-        const successfulHeadReads = originHeadReads;
 
         assert.equal(status.isRepo, true);
         assert.equal(status.branch, "feature/remote-status");
+        assert.equal(status.defaultBranch, "trunk");
         assert.equal(status.hasUpstream, true);
         assert.equal(status.aheadCount, 0);
         assert.equal(status.behindCount, 0);
         assert.equal(status.aheadOfDefaultCount, 1);
         assert.notProperty(status, "workingTree");
         assert.notProperty(status, "hasWorkingTreeChanges");
+        assert.equal(originHeadReads, 1);
 
-        // An unavailable first read must retain the comparison lookup's retry.
+        // With no main/master fallback, the retry must resolve trunk to preserve the ahead count.
         originHeadReads = 0;
         failFirstOriginHead = true;
         const retried = yield* driver.statusDetailsRemote(cwd, { refreshUpstream: false });
         assert.deepEqual(retried, { ...status, defaultBranch: null });
         assert.equal(originHeadReads, 2);
-        assert.equal(successfulHeadReads, 1);
       }),
     );
 
