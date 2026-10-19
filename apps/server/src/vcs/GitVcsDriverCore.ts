@@ -1687,7 +1687,6 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
     refName: string,
     options?: {
       readonly allowRemoteOfCurrent?: boolean;
-      /** Null can mean a failed lookup, so only a successful value skips the retry. */
       readonly knownOriginDefaultBranch?: string | null;
     },
   ) {
@@ -1706,7 +1705,7 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
       Effect.orElseSucceed(() => null),
     );
     const candidates = [
-      Effect.succeed(configuredBaseBranch.length > 0 ? configuredBaseBranch : null),
+      Effect.succeed(configuredBaseBranch),
       primaryRemoteName === null
         ? Effect.succeed(null)
         : primaryRemoteName === "origin" && options?.knownOriginDefaultBranch != null
@@ -1716,7 +1715,6 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
     ];
 
     for (const readCandidate of candidates) {
-      // Resolve the remote default only if the configured base could not be used.
       const candidate = yield* readCandidate;
       if (!candidate) {
         continue;
